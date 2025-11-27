@@ -44,6 +44,10 @@ def parse_args():
     parser.add_argument("--scene_dir", type=str, required=True, help="Directory containing the scene images")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--use_ba", action="store_true", default=False, help="Use BA for reconstruction")
+    parser.add_argument("--use_tiling", action="store_true", default=False, help="Use tiled inference for dense depth")
+    parser.add_argument("--tile_size", type=int, default=518, help="Square tile size for tiled inference")
+    parser.add_argument("--tile_overlap", type=int, default=64, help="Overlap between tiles in pixels")
+    parser.add_argument("--tile_batch_size", type=int, default=8, help="Batch size when running tiled inference")
     ######### BA parameters #########
     parser.add_argument(
         "--max_reproj_error", type=float, default=8.0, help="Maximum reprojection error for reconstruction"
@@ -88,6 +92,78 @@ def run_VGGT(model, images, dtype, resolution=518):
     depth_map = depth_map.squeeze(0).cpu().numpy()
     depth_conf = depth_conf.squeeze(0).cpu().numpy()
     return extrinsic, intrinsic, depth_map, depth_conf
+
+
+def _build_tile_start_points(image_size, tile_size, overlap):
+    stride = tile_size - overlap
+    max_start = image_size - tile_size
+
+    if max_start <= 0:
+        return [0]
+
+    starts = list(range(0, max_start + 1, stride))
+    if starts[-1] != max_start:
+        starts.append(max_start)
+    return starts
+
+
+def run_tiled_depth(
+    model,
+    images,
+    dtype,
+    tile_size,
+    tile_overlap,
+    tile_batch_size,
+    base_intrinsic,
+    base_resolution,
+    load_resolution,
+    device,
+):
+    num_frames, _, height, width = images.shape
+    if tile_size > height or tile_size > width:
+        raise ValueError(f"tile_size ({tile_size}) must be <= loaded image size ({height}x{width})")
+
+    y_starts = _build_tile_start_points(height, tile_size, tile_overlap)
+    x_starts = _build_tile_start_points(width, tile_size, tile_overlap)
+
+    depth_accum = torch.zeros((num_frames, height, width), device=device)
+    conf_accum = torch.zeros_like(depth_accum)
+
+    tiles = []
+    tile_meta = []
+    for img_idx in range(num_frames):
+        for y in y_starts:
+            for x in x_starts:
+                tiles.append(images[img_idx : img_idx + 1, :, y : y + tile_size, x : x + tile_size])
+                tile_meta.append((img_idx, y, x))
+
+    scale = load_resolution / base_resolution
+    adjusted_intrinsic = base_intrinsic.copy()
+    adjusted_intrinsic[:, :2, :] *= scale
+
+    for start_idx in range(0, len(tiles), tile_batch_size):
+        batch_tiles = torch.cat(tiles[start_idx : start_idx + tile_batch_size], dim=0)
+        _, _, depth_map, depth_conf = run_VGGT(model, batch_tiles, dtype, resolution=tile_size)
+
+        depth_map_t = torch.from_numpy(depth_map).to(device)
+        depth_conf_t = torch.from_numpy(depth_conf).to(device)
+
+        for local_idx, (img_idx, y, x) in enumerate(tile_meta[start_idx : start_idx + tile_batch_size]):
+            depth_slice = depth_map_t[local_idx]
+            conf_slice = depth_conf_t[local_idx]
+
+            depth_accum[img_idx, y : y + tile_size, x : x + tile_size] += depth_slice * conf_slice
+            conf_accum[img_idx, y : y + tile_size, x : x + tile_size] += conf_slice
+
+    valid_mask = conf_accum > 0
+    fused_depth = torch.zeros_like(depth_accum)
+    fused_depth[valid_mask] = depth_accum[valid_mask] / conf_accum[valid_mask]
+
+    # Normalize confidence to [0, 1]
+    max_conf = conf_accum.max().clamp(min=1e-6)
+    fused_conf = (conf_accum / max_conf).clamp(max=1.0)
+
+    return fused_depth.cpu().numpy(), fused_conf.cpu().numpy(), adjusted_intrinsic
 
 
 def demo_fn(args):
@@ -137,12 +213,31 @@ def demo_fn(args):
     # Run VGGT to estimate camera and depth
     # Run with 518x518 images
     extrinsic, intrinsic, depth_map, depth_conf = run_VGGT(model, images, dtype, vggt_fixed_resolution)
-    points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
+
+    if args.use_tiling:
+        depth_map, depth_conf, depth_intrinsic = run_tiled_depth(
+            model,
+            images,
+            dtype,
+            tile_size=args.tile_size,
+            tile_overlap=args.tile_overlap,
+            tile_batch_size=args.tile_batch_size,
+            base_intrinsic=intrinsic,
+            base_resolution=vggt_fixed_resolution,
+            load_resolution=img_load_resolution,
+            device=device,
+        )
+    else:
+        depth_intrinsic = intrinsic
+
+    points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, depth_intrinsic)
 
     if args.use_ba:
         image_size = np.array(images.shape[-2:])
         scale = img_load_resolution / vggt_fixed_resolution
         shared_camera = args.shared_camera
+        intrinsic_ba = intrinsic.copy()
+        intrinsic_ba[:, :2, :] *= scale
 
         with torch.cuda.amp.autocast(dtype=dtype):
             # Predicting Tracks
@@ -166,7 +261,7 @@ def demo_fn(args):
             torch.cuda.empty_cache()
 
         # rescale the intrinsic matrix from 518 to 1024
-        intrinsic[:, :2, :] *= scale
+        intrinsic = intrinsic_ba
         track_mask = pred_vis_scores > args.vis_thresh
 
         # TODO: radial distortion, iterative BA, masks
@@ -197,12 +292,11 @@ def demo_fn(args):
         shared_camera = False  # in the feedforward manner, we do not support shared camera
         camera_type = "PINHOLE"  # in the feedforward manner, we only support PINHOLE camera
 
-        image_size = np.array([vggt_fixed_resolution, vggt_fixed_resolution])
+        image_size = np.array([img_load_resolution, img_load_resolution]) if args.use_tiling else np.array([vggt_fixed_resolution, vggt_fixed_resolution])
         num_frames, height, width, _ = points_3d.shape
 
-        points_rgb = F.interpolate(
-            images, size=(vggt_fixed_resolution, vggt_fixed_resolution), mode="bilinear", align_corners=False
-        )
+        rgb_resolution = img_load_resolution if args.use_tiling else vggt_fixed_resolution
+        points_rgb = F.interpolate(images, size=(rgb_resolution, rgb_resolution), mode="bilinear", align_corners=False)
         points_rgb = (points_rgb.cpu().numpy() * 255).astype(np.uint8)
         points_rgb = points_rgb.transpose(0, 2, 3, 1)
 
@@ -229,7 +323,7 @@ def demo_fn(args):
             camera_type=camera_type,
         )
 
-        reconstruction_resolution = vggt_fixed_resolution
+        reconstruction_resolution = rgb_resolution
 
     reconstruction = rename_colmap_recons_and_rescale_camera(
         reconstruction,
